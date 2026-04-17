@@ -42,7 +42,7 @@ def get_season_game_log(player_id: int, season: str) -> pd.DataFrame:
     cols = ["GAME_DATE", "MATCHUP", "WL", "MIN", "PTS", "REB", "AST",
             "FGA", "FGM", "FG_PCT", "FG3A", "FG3M", "FTA", "FTM", "TOV"]
     df = df[[c for c in cols if c in df.columns]].copy()
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], format="mixed")
     df["SEASON"] = season
     df["OPP"] = df["MATCHUP"].apply(lambda x: x.split()[-1])
     return df
