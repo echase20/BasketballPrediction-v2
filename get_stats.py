@@ -1,11 +1,14 @@
 import time
 import numpy as np
 import pandas as pd
+from datetime import date, timedelta
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import (
     PlayerGameLog,
     PlayerCareerStats,
     LeagueDashTeamStats,
+    CommonPlayerInfo,
+    ScoreboardV2,
 )
 
 LEAGUE_AVG_PTS_ALLOWED = 112.0
@@ -181,9 +184,57 @@ def build_career_dataset(first_name: str, last_name: str) -> dict:
         "test": test,
         "full": dataset,
         "fallback_avg": fallback_avg,
+        "player_id": player_id,
         "current_season": game_log["SEASON"].iloc[-1],
         "league_defense_by_season": league_defense_by_season,
     }
+
+
+def get_next_opponent(player_id: int, days_ahead: int = 14) -> dict | None:
+    """
+    Find a player's next scheduled game by scanning upcoming dates with ScoreboardV2.
+
+    Returns a dict with keys: opponent, game_date, home_or_away
+    Returns None if no game is found within days_ahead days.
+    """
+    info = CommonPlayerInfo(player_id=player_id)
+    player_df = info.get_data_frames()[0]
+    team_id = str(player_df["TEAM_ID"].values[0])
+
+    team_list = teams.get_teams()
+
+    for i in range(days_ahead):
+        check_date = date.today() + timedelta(days=i)
+        date_str = check_date.strftime("%m/%d/%Y")
+        time.sleep(0.3)
+        try:
+            scoreboard = ScoreboardV2(game_date=date_str)
+            games_df = scoreboard.get_data_frames()[0]  # GameHeader
+            if games_df.empty:
+                continue
+
+            team_games = games_df[
+                (games_df["HOME_TEAM_ID"].astype(str) == team_id) |
+                (games_df["VISITOR_TEAM_ID"].astype(str) == team_id)
+            ]
+            if team_games.empty:
+                continue
+
+            game = team_games.iloc[0]
+            is_home = str(game["HOME_TEAM_ID"]) == team_id
+            opp_id = str(game["VISITOR_TEAM_ID"] if is_home else game["HOME_TEAM_ID"])
+
+            opp_team = next((t for t in team_list if str(t["id"]) == opp_id), None)
+            if opp_team:
+                return {
+                    "opponent": opp_team["abbreviation"],
+                    "game_date": check_date.strftime("%Y-%m-%d"),
+                    "home_or_away": "HOME" if is_home else "AWAY",
+                }
+        except Exception:
+            continue
+
+    return None
 
 
 def get_next_game_features(data: dict, next_opp: str) -> dict:
