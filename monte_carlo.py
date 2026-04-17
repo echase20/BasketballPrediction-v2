@@ -1,20 +1,17 @@
 """
 Monte Carlo Search Tree for NBA points prediction via weight optimization.
 
-The tree searches over combinations of 5 feature weights (summing to 100)
-to find the weighting equation that best predicts a player's historical
-scoring. The winning weights are then applied to next-game features
-to produce a prediction.
+Training phase:
+    The tree searches over combinations of 5 feature weights (summing to 100)
+    to find the equation that minimizes MAE on the training set (full career
+    minus last 20 games).
 
-Features (5):
-    1. ROLLING_AVG_PTS  — season rolling average
-    2. CAREER_AVG_PTS   — career PPG
-    3. RECENT_FORM      — last 5 games average
-    4. VS_OPP_AVG       — historical avg vs next opponent
-    5. OPP_ADJ          — rolling avg scaled by opponent defensive strength
+Test phase:
+    The optimal weights are applied to each of the last 20 games to produce
+    a predicted score, which is then compared against the actual score.
 
 Prediction equation:
-    pts = (w1*ROLLING_AVG + w2*CAREER_AVG + w3*RECENT_FORM
+    pts = (w1*ROLLING_AVG_PTS + w2*CAREER_AVG_PTS + w3*RECENT_FORM
            + w4*VS_OPP_AVG + w5*OPP_ADJ) / 100
 """
 
@@ -27,23 +24,19 @@ from typing import Optional
 
 FEATURES = ["ROLLING_AVG_PTS", "CAREER_AVG_PTS", "RECENT_FORM", "VS_OPP_AVG", "OPP_ADJ"]
 N_FEATURES = len(FEATURES)
-WEIGHT_STEP = 5      # weights move in increments of 5
+WEIGHT_STEP = 5
 WEIGHT_SUM = 100
 
 
 def _random_weights() -> list[int]:
     """Generate a random valid weight combination summing to WEIGHT_SUM."""
-    cuts = sorted(random.sample(range(0, WEIGHT_SUM + 1, WEIGHT_STEP),
-                                N_FEATURES - 1))
+    cuts = sorted(random.sample(range(0, WEIGHT_SUM + 1, WEIGHT_STEP), N_FEATURES - 1))
     cuts = [0] + cuts + [WEIGHT_SUM]
     return [cuts[i + 1] - cuts[i] for i in range(N_FEATURES)]
 
 
 def _perturb_weights(weights: list[int], n: int = 8) -> list[list[int]]:
-    """
-    Generate n neighboring weight combinations by transferring
-    WEIGHT_STEP units from one feature to another.
-    """
+    """Generate n neighboring weight combinations by moving WEIGHT_STEP units between features."""
     neighbors = []
     attempts = 0
     while len(neighbors) < n and attempts < n * 10:
@@ -61,21 +54,23 @@ def _perturb_weights(weights: list[int], n: int = 8) -> list[list[int]]:
 
 def _evaluate(weights: list[int], dataset: pd.DataFrame) -> float:
     """
-    Score a weight combination by computing the weighted prediction
-    for each historical game and returning the Mean Absolute Error
-    against actual points scored.
-
-    Lower MAE = better weights.
+    Score a weight combination against a dataset.
+    Returns MAE between weighted prediction and actual PTS.
+    Lower is better.
     """
     df = dataset.dropna(subset=FEATURES + ["PTS"])
     if df.empty:
         return float("inf")
+    w = np.array(weights) / WEIGHT_SUM
+    predicted = df[FEATURES].values @ w
+    return float(np.mean(np.abs(predicted - df["PTS"].values)))
 
-    feature_matrix = df[FEATURES].values          # shape (n_games, 5)
-    w = np.array(weights) / WEIGHT_SUM            # normalize to sum=1
-    predicted = feature_matrix @ w                 # dot product per game
-    actual = df["PTS"].values
-    return float(np.mean(np.abs(predicted - actual)))
+
+def _predict_single(weights: list[int], features: dict) -> float:
+    """Apply weights to a single game's feature dict and return predicted points."""
+    w = np.array(weights) / WEIGHT_SUM
+    values = np.array([features[f] for f in FEATURES])
+    return round(float(w @ values), 1)
 
 
 @dataclass
@@ -91,16 +86,10 @@ class Node:
         return self.total_error / self.visits if self.visits > 0 else float("inf")
 
     def uct_score(self, exploration: float = 1.41) -> float:
-        """
-        UCT adapted for minimization: lower error is better,
-        so we negate avg_error for the exploitation term.
-        """
         if self.visits == 0:
             return float("inf")
         parent_visits = self.parent.visits if self.parent else self.visits
-        exploitation = -self.avg_error
-        exploration_bonus = exploration * math.sqrt(math.log(parent_visits) / self.visits)
-        return exploitation + exploration_bonus
+        return -self.avg_error + exploration * math.sqrt(math.log(parent_visits) / self.visits)
 
     def best_child(self) -> "Node":
         return max(self.children, key=lambda c: c.uct_score())
@@ -111,30 +100,29 @@ class Node:
 
 class MonteCarloPredictor:
     """
-    Monte Carlo Search Tree that finds the optimal feature weighting
-    equation to predict NBA player points.
+    Monte Carlo Search Tree that finds the optimal feature weighting equation.
 
     Parameters
     ----------
-    dataset : pd.DataFrame
-        Historical game log with all 5 feature columns and actual PTS.
-        Produced by get_stats.build_dataset().
+    train : pd.DataFrame
+        Training set — all career games except the last TEST_GAMES.
+        Must contain the 5 FEATURES columns and PTS.
     simulations : int
-        Number of MCST iterations to run.
+        Number of MCST iterations for weight optimization.
     branching_factor : int
-        Number of weight perturbations to branch from each node.
+        Child nodes generated per expansion.
     """
 
-    def __init__(self, dataset: pd.DataFrame, simulations: int = 500,
+    def __init__(self, train: pd.DataFrame, simulations: int = 500,
                  branching_factor: int = 8):
-        self.dataset = dataset
+        self.train = train
         self.simulations = simulations
         self.branching_factor = branching_factor
-
         equal = [WEIGHT_SUM // N_FEATURES] * N_FEATURES
         self.root = Node(weights=equal)
+        self.optimal_weights: list[int] | None = None
 
-    def _select(self) -> "Node":
+    def _select(self) -> Node:
         node = self.root
         while not node.is_leaf():
             node = node.best_child()
@@ -142,13 +130,7 @@ class MonteCarloPredictor:
 
     def _expand(self, node: Node):
         for w in _perturb_weights(node.weights, self.branching_factor):
-            child = Node(weights=w, parent=node)
-            node.children.append(child)
-
-    def _simulate(self, node: Node) -> float:
-        """Rollout: evaluate a random neighbor of this node's weights."""
-        random_weights = _random_weights()
-        return _evaluate(random_weights, self.dataset)
+            node.children.append(Node(weights=w, parent=node))
 
     def _backpropagate(self, node: Node, error: float):
         current = node
@@ -157,95 +139,113 @@ class MonteCarloPredictor:
             current.total_error += error
             current = current.parent
 
-    def run(self) -> dict:
+    def train_weights(self) -> dict:
         """
-        Run the MCST weight search.
+        Run the MCST to find optimal feature weights on the training set.
 
         Returns
         -------
         dict with keys:
             optimal_weights  — list of 5 ints summing to 100
-            feature_names    — the 5 feature labels
-            mae              — historical MAE of the optimal weights
-            weight_map       — {feature: weight} dict for readability
+            weight_map       — {feature: weight}
+            train_mae        — MAE of optimal weights on training data
         """
         best_node = self.root
         best_error = float("inf")
 
         for _ in range(self.simulations):
-            # Selection
             node = self._select()
 
-            # Expansion
             if node.visits > 0 or node is self.root:
                 self._expand(node)
                 if node.children:
                     node = random.choice(node.children)
 
-            # Simulation (evaluate this node's weights directly)
-            error = _evaluate(node.weights, self.dataset)
+            error = _evaluate(node.weights, self.train)
 
-            # Track global best
             if error < best_error:
                 best_error = error
                 best_node = node
 
-            # Backpropagation
             self._backpropagate(node, error)
 
-        optimal = best_node.weights
+        self.optimal_weights = best_node.weights
         return {
-            "optimal_weights": optimal,
-            "feature_names": FEATURES,
-            "mae": round(best_error, 3),
-            "weight_map": dict(zip(FEATURES, optimal)),
+            "optimal_weights": self.optimal_weights,
+            "weight_map": dict(zip(FEATURES, self.optimal_weights)),
+            "train_mae": round(best_error, 3),
         }
 
-    def predict(self, next_game_features: dict, optimal_weights: list[int]) -> float:
+    def evaluate_test(self, test: pd.DataFrame) -> dict:
         """
-        Apply the optimal weights to next-game features to produce a prediction.
+        Apply the optimal weights to the test set (last 20 games) and
+        report game-by-game predictions vs actuals.
 
         Parameters
         ----------
-        next_game_features : dict
-            Feature values for the upcoming game (from get_stats.get_next_game_features).
-        optimal_weights : list[int]
-            Weight combination found by run().
+        test : pd.DataFrame
+            The held-out test games from build_career_dataset().
+
+        Returns
+        -------
+        dict with keys:
+            results     — DataFrame with GAME_DATE, OPP, ACTUAL, PREDICTED, ERROR
+            test_mae    — mean absolute error on the test set
+            test_rmse   — root mean squared error on the test set
+            within_5    — % of predictions within 5 points of actual
+            within_10   — % of predictions within 10 points of actual
         """
-        w = np.array(optimal_weights) / WEIGHT_SUM
-        feature_values = np.array([next_game_features[f] for f in FEATURES])
-        return round(float(w @ feature_values), 1)
+        if self.optimal_weights is None:
+            raise RuntimeError("Call train_weights() before evaluate_test().")
+
+        df = test.dropna(subset=FEATURES + ["PTS"]).copy()
+        w = np.array(self.optimal_weights) / WEIGHT_SUM
+        df["PREDICTED"] = (df[FEATURES].values @ w).round(1)
+        df["ACTUAL"] = df["PTS"]
+        df["ERROR"] = (df["PREDICTED"] - df["ACTUAL"]).round(1)
+        df["ABS_ERROR"] = df["ERROR"].abs()
+
+        results = df[["GAME_DATE", "SEASON", "OPP", "ACTUAL", "PREDICTED", "ERROR"]].copy()
+        errors = df["ABS_ERROR"].values
+
+        return {
+            "results": results.reset_index(drop=True),
+            "test_mae": round(float(np.mean(errors)), 3),
+            "test_rmse": round(float(np.sqrt(np.mean(errors ** 2))), 3),
+            "within_5": round(float(np.mean(errors <= 5) * 100), 1),
+            "within_10": round(float(np.mean(errors <= 10) * 100), 1),
+        }
 
 
 if __name__ == "__main__":
-    # Smoke test with synthetic data
+    # Smoke test with synthetic career-length data
     rng = np.random.default_rng(42)
-    n = 60
+    n = 800
     rolling = rng.normal(27, 3, n).clip(10)
     fake_data = pd.DataFrame({
         "PTS":             rng.normal(27, 7, n).clip(0).round(1),
         "ROLLING_AVG_PTS": rolling.round(2),
-        "CAREER_AVG_PTS":  np.full(n, 26.5),
+        "CAREER_AVG_PTS":  np.linspace(20, 27, n).round(2),
         "RECENT_FORM":     rng.normal(27, 5, n).clip(0).round(2),
         "VS_OPP_AVG":      rng.normal(25, 6, n).clip(0).round(2),
         "OPP_ADJ":         (rolling * rng.uniform(0.9, 1.1, n)).round(2),
+        "GAME_DATE":       pd.date_range("2010-01-01", periods=n, freq="3D"),
+        "SEASON":          ["2010-11"] * 400 + ["2011-12"] * 400,
+        "OPP":             rng.choice(["MIA", "LAL", "GSW", "BOS", "CHI"], n),
     })
 
-    predictor = MonteCarloPredictor(fake_data, simulations=300)
-    results = predictor.run()
+    train, test = fake_data.iloc[:-20], fake_data.iloc[-20:]
 
-    print("Optimal weight equation:")
-    for feat, w in results["weight_map"].items():
+    predictor = MonteCarloPredictor(train, simulations=300)
+    train_results = predictor.train_weights()
+    test_results = predictor.evaluate_test(test)
+
+    print("Optimal weights:")
+    for feat, w in train_results["weight_map"].items():
         print(f"  {feat}: {w}%")
-    print(f"Historical MAE: {results['mae']} pts")
-
-    # Simulate a next-game prediction
-    next_game = {
-        "ROLLING_AVG_PTS": 27.3,
-        "CAREER_AVG_PTS":  26.5,
-        "RECENT_FORM":     29.1,
-        "VS_OPP_AVG":      24.8,
-        "OPP_ADJ":         26.0,
-    }
-    pred = predictor.predict(next_game, results["optimal_weights"])
-    print(f"\nPredicted points: {pred}")
+    print(f"Train MAE: {train_results['train_mae']} pts")
+    print(f"\nTest MAE:      {test_results['test_mae']} pts")
+    print(f"Test RMSE:     {test_results['test_rmse']} pts")
+    print(f"Within 5 pts:  {test_results['within_5']}%")
+    print(f"Within 10 pts: {test_results['within_10']}%")
+    print(f"\n{test_results['results'].to_string()}")

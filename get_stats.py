@@ -1,13 +1,15 @@
+import time
+import numpy as np
 import pandas as pd
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import (
     PlayerGameLog,
     PlayerCareerStats,
-    TeamDashboardByOpponent,
+    LeagueDashTeamStats,
 )
-import time
 
 LEAGUE_AVG_PTS_ALLOWED = 112.0
+TEST_GAMES = 20
 
 
 def get_player_id(first_name: str, last_name: str) -> int:
@@ -18,142 +20,175 @@ def get_player_id(first_name: str, last_name: str) -> int:
     return matches[0]["id"]
 
 
-def get_game_log(player_id: int, season: str = "2023-24") -> pd.DataFrame:
-    """Return a cleaned game log for a player in a given season."""
-    log = PlayerGameLog(player_id=player_id, season=season)
-    df = log.get_data_frames()[0]
+def get_all_seasons(player_id: int) -> list[str]:
+    """Return list of every season the player appeared in, oldest first."""
+    career = PlayerCareerStats(player_id=player_id)
+    df = career.get_data_frames()[0]
+    return df[df["SEASON_ID"] != "Career"]["SEASON_ID"].tolist()
+
+
+def get_season_game_log(player_id: int, season: str) -> pd.DataFrame:
+    """Return raw game log for a single season, or empty DataFrame on failure."""
+    time.sleep(0.5)
+    try:
+        log = PlayerGameLog(player_id=player_id, season=season)
+        df = log.get_data_frames()[0]
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
 
     cols = ["GAME_DATE", "MATCHUP", "WL", "MIN", "PTS", "REB", "AST",
             "FGA", "FGM", "FG_PCT", "FG3A", "FG3M", "FTA", "FTM", "TOV"]
-    df = df[cols].copy()
+    df = df[[c for c in cols if c in df.columns]].copy()
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df.sort_values("GAME_DATE").reset_index(drop=True)
-
-    # Extract opponent abbreviation from MATCHUP (e.g. "BOS vs. MIA" -> "MIA")
+    df["SEASON"] = season
     df["OPP"] = df["MATCHUP"].apply(lambda x: x.split()[-1])
-
     return df
 
 
-def get_career_avg(player_id: int) -> float:
-    """Return a player's career points per game average."""
-    career = PlayerCareerStats(player_id=player_id)
-    df = career.get_data_frames()[0]
-    totals = df[df["SEASON_ID"] == "Career"]
-    if totals.empty:
-        return round(float(df["PTS"].iloc[-1]), 2)
-    return round(float(totals["PTS"].values[0]), 2)
-
-
-def get_opponent_defense(team_abbreviation: str, season: str = "2023-24") -> dict:
-    """Return defensive stats (pts allowed per game) for a given team."""
-    team_list = teams.get_teams()
-    team = next((t for t in team_list if t["abbreviation"] == team_abbreviation), None)
-    if team is None:
-        raise ValueError(f"Team abbreviation '{team_abbreviation}' not found.")
-
-    time.sleep(0.6)  # Respect NBA API rate limits
-    dashboard = TeamDashboardByOpponent(team_id=team["id"], season=season)
-    df = dashboard.get_data_frames()[0]
-
-    return {
-        "OPP_PTS_ALLOWED": round(float(df["OPP_PTS"].mean()), 2),
-        "OPP_FG_PCT": round(float(df["OPP_FG_PCT"].mean()), 4),
-    }
-
-
-def add_features(game_log: pd.DataFrame, career_avg: float,
-                 opp_defense_map: dict) -> pd.DataFrame:
+def get_league_defense(season: str) -> dict:
     """
-    Add the 5 prediction features to the game log:
-      1. ROLLING_AVG_PTS  — expanding season average up to (not including) this game
-      2. CAREER_AVG_PTS   — career PPG (constant)
-      3. RECENT_FORM      — average points over the last 5 games
-      4. VS_OPP_AVG       — historical avg points vs this opponent in prior games
-      5. OPP_ADJ          — season avg scaled by opponent defensive strength
+    Return {team_abbreviation: pts_allowed_per_game} for all teams in a season.
+    Uses LeagueDashTeamStats in Opponent measure mode (one API call per season).
+    Falls back to league average on failure.
+    """
+    time.sleep(0.5)
+    try:
+        stats = LeagueDashTeamStats(
+            season=season,
+            measure_type_detailed_defense="Opponent",
+            per_mode_simple="PerGame",
+        )
+        df = stats.get_data_frames()[0]
+        # In Opponent mode, PTS = points the team allows per game
+        return dict(zip(df["TEAM_ABBREVIATION"], df["PTS"]))
+    except Exception:
+        return {}
+
+
+def get_full_career_log(player_id: int) -> pd.DataFrame:
+    """Pull and concatenate game logs for every season in a player's career."""
+    seasons = get_all_seasons(player_id)
+    print(f"  Fetching game logs across {len(seasons)} seasons...")
+    dfs = []
+    for season in seasons:
+        df = get_season_game_log(player_id, season)
+        if not df.empty:
+            dfs.append(df)
+
+    if not dfs:
+        raise ValueError("No game log data found for this player.")
+
+    full = pd.concat(dfs, ignore_index=True)
+    full = full.sort_values("GAME_DATE").reset_index(drop=True)
+    return full
+
+
+def add_features(game_log: pd.DataFrame, fallback_avg: float,
+                 league_defense_by_season: dict) -> pd.DataFrame:
+    """
+    Add the 5 prediction features to the career game log.
+    All features use only data available BEFORE each game (no lookahead).
+
+    Features:
+        1. ROLLING_AVG_PTS  — expanding season average (resets each season)
+        2. CAREER_AVG_PTS   — expanding career average across all seasons
+        3. RECENT_FORM      — last 5 games average (crosses seasons)
+        4. VS_OPP_AVG       — career average vs this specific opponent
+        5. OPP_ADJ          — rolling season avg scaled by opponent defense that season
     """
     df = game_log.copy()
 
-    # 1. Rolling season average (shift by 1 so we only use prior games)
-    df["ROLLING_AVG_PTS"] = df["PTS"].shift(1).expanding().mean().round(2)
-    df["ROLLING_AVG_PTS"].fillna(career_avg, inplace=True)
-
-    # 2. Career average
-    df["CAREER_AVG_PTS"] = career_avg
-
-    # 3. Recent form: avg of last 5 games (using prior games only)
-    df["RECENT_FORM"] = df["PTS"].shift(1).rolling(5, min_periods=1).mean().round(2)
-    df["RECENT_FORM"].fillna(career_avg, inplace=True)
-
-    # 4. Historical avg vs this specific opponent (prior games only)
-    vs_opp = []
-    for i, row in df.iterrows():
-        prior = df.loc[:i - 1]
-        prior_vs_opp = prior[prior["OPP"] == row["OPP"]]["PTS"]
-        vs_opp.append(round(prior_vs_opp.mean(), 2) if not prior_vs_opp.empty else career_avg)
-    df["VS_OPP_AVG"] = vs_opp
-
-    # 5. Opponent-adjusted expectation: rolling avg scaled by how good/bad the defense is
-    df["OPP_PTS_ALLOWED"] = df["OPP"].map(
-        lambda opp: opp_defense_map.get(opp, {}).get("OPP_PTS_ALLOWED", LEAGUE_AVG_PTS_ALLOWED)
+    # 1. Season rolling average (shift by 1 to exclude current game)
+    df["ROLLING_AVG_PTS"] = (
+        df.groupby("SEASON")["PTS"]
+        .transform(lambda x: x.shift(1).expanding().mean())
+        .fillna(fallback_avg)
+        .round(2)
     )
-    df["OPP_ADJ"] = (df["ROLLING_AVG_PTS"] * (df["OPP_PTS_ALLOWED"] / LEAGUE_AVG_PTS_ALLOWED)).round(2)
+
+    # 2. Career average up to (not including) each game
+    df["CAREER_AVG_PTS"] = (
+        df["PTS"].shift(1).expanding().mean()
+        .fillna(fallback_avg)
+        .round(2)
+    )
+
+    # 3. Recent form: last 5 games (cross-season, shift by 1)
+    df["RECENT_FORM"] = (
+        df["PTS"].shift(1).rolling(5, min_periods=1).mean()
+        .fillna(fallback_avg)
+        .round(2)
+    )
+
+    # 4. Historical avg vs this opponent (O(n), no lookahead)
+    vs_opp_avgs = []
+    opp_history: dict[str, list] = {}
+    for _, row in df.iterrows():
+        opp = row["OPP"]
+        history = opp_history.get(opp, [])
+        vs_opp_avgs.append(round(np.mean(history), 2) if history else fallback_avg)
+        opp_history.setdefault(opp, []).append(row["PTS"])
+    df["VS_OPP_AVG"] = vs_opp_avgs
+
+    # 5. Opponent-adjusted expectation: season rolling avg * (opp defense / league avg)
+    def opp_adj(row):
+        season_defense = league_defense_by_season.get(row["SEASON"], {})
+        pts_allowed = season_defense.get(row["OPP"], LEAGUE_AVG_PTS_ALLOWED)
+        return round(row["ROLLING_AVG_PTS"] * (pts_allowed / LEAGUE_AVG_PTS_ALLOWED), 2)
+
+    df["OPP_ADJ"] = df.apply(opp_adj, axis=1)
 
     return df
 
 
-def build_dataset(first_name: str, last_name: str, season: str = "2023-24") -> pd.DataFrame:
+def build_career_dataset(first_name: str, last_name: str) -> dict:
     """
-    Build the full feature dataset for a player.
-    Returns a DataFrame with all 5 prediction features and actual PTS for each game.
+    Build the full career dataset and split into train/test.
+
+    Returns
+    -------
+    dict with keys:
+        train     — all games except the last TEST_GAMES
+        test      — the last TEST_GAMES games
+        full      — complete dataset
+        fallback_avg — career PPG used as feature fallback
     """
     player_id = get_player_id(first_name, last_name)
-    print(f"Found player: {first_name} {last_name} (ID: {player_id})")
+    print(f"Found: {first_name} {last_name} (ID: {player_id})")
 
-    game_log = get_game_log(player_id, season)
-    career_avg = get_career_avg(player_id)
-    print(f"Career PPG: {career_avg}")
+    game_log = get_full_career_log(player_id)
+    fallback_avg = round(float(game_log["PTS"].mean()), 2)
+    print(f"  Total games: {len(game_log)} | Career PPG: {fallback_avg}")
 
-    print("Fetching opponent defensive stats (this may take a moment)...")
-    opp_defense_map = {}
-    for opp in game_log["OPP"].unique():
-        try:
-            opp_defense_map[opp] = get_opponent_defense(opp, season)
-        except Exception:
-            opp_defense_map[opp] = {"OPP_PTS_ALLOWED": LEAGUE_AVG_PTS_ALLOWED, "OPP_FG_PCT": None}
+    # Fetch opponent defensive stats per season (one call per season)
+    seasons = game_log["SEASON"].unique().tolist()
+    print(f"  Fetching league defense for {len(seasons)} seasons...")
+    league_defense_by_season = {}
+    for season in seasons:
+        league_defense_by_season[season] = get_league_defense(season)
 
-    dataset = add_features(game_log, career_avg, opp_defense_map)
-    return dataset
+    dataset = add_features(game_log, fallback_avg, league_defense_by_season)
 
-
-def get_next_game_features(first_name: str, last_name: str,
-                           next_opp: str, season: str = "2023-24") -> dict:
-    """
-    Return the 5 prediction features for a player's NEXT game against next_opp.
-    Uses the most recent values from the current season log.
-    """
-    dataset = build_dataset(first_name, last_name, season)
-    last = dataset.iloc[-1]
-
-    opp_defense = get_opponent_defense(next_opp, season)
-    rolling_avg = last["ROLLING_AVG_PTS"]
-    opp_adj = round(rolling_avg * (opp_defense["OPP_PTS_ALLOWED"] / LEAGUE_AVG_PTS_ALLOWED), 2)
-
-    prior_vs_opp = dataset[dataset["OPP"] == next_opp]["PTS"]
-    vs_opp_avg = round(prior_vs_opp.mean(), 2) if not prior_vs_opp.empty else last["CAREER_AVG_PTS"]
+    train = dataset.iloc[:-TEST_GAMES].copy()
+    test = dataset.iloc[-TEST_GAMES:].copy()
+    print(f"  Train: {len(train)} games | Test: {len(test)} games")
 
     return {
-        "ROLLING_AVG_PTS": rolling_avg,
-        "CAREER_AVG_PTS": last["CAREER_AVG_PTS"],
-        "RECENT_FORM": last["RECENT_FORM"],
-        "VS_OPP_AVG": vs_opp_avg,
-        "OPP_ADJ": opp_adj,
-        "dataset": dataset,
+        "train": train,
+        "test": test,
+        "full": dataset,
+        "fallback_avg": fallback_avg,
     }
 
 
 if __name__ == "__main__":
-    df = build_dataset("Jayson", "Tatum", season="2023-24")
-    features = ["GAME_DATE", "OPP", "PTS", "ROLLING_AVG_PTS", "CAREER_AVG_PTS",
-                "RECENT_FORM", "VS_OPP_AVG", "OPP_ADJ"]
-    print(df[features].to_string())
+    data = build_career_dataset("Jayson", "Tatum")
+    cols = ["GAME_DATE", "SEASON", "OPP", "PTS",
+            "ROLLING_AVG_PTS", "CAREER_AVG_PTS", "RECENT_FORM", "VS_OPP_AVG", "OPP_ADJ"]
+    print("\n--- Last 5 rows of training set ---")
+    print(data["train"][cols].tail().to_string())
+    print("\n--- Test set (last 20 games) ---")
+    print(data["test"][cols].to_string())
