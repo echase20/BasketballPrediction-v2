@@ -181,6 +181,48 @@ def build_career_dataset(first_name: str, last_name: str) -> dict:
         "test": test,
         "full": dataset,
         "fallback_avg": fallback_avg,
+        "current_season": game_log["SEASON"].iloc[-1],
+        "league_defense_by_season": league_defense_by_season,
+    }
+
+
+def get_next_game_features(data: dict, next_opp: str) -> dict:
+    """
+    Build the 5 prediction features for an upcoming game against next_opp.
+    Uses the latest values from the end of the full career dataset.
+
+    Parameters
+    ----------
+    data : dict
+        Output of build_career_dataset().
+    next_opp : str
+        Opponent team abbreviation (e.g. "MIA").
+    """
+    full = data["full"]
+    last = full.iloc[-1]
+    current_season = data["current_season"]
+    fallback = data["fallback_avg"]
+
+    # Latest rolling and career averages
+    rolling_avg = last["ROLLING_AVG_PTS"]
+    career_avg = last["CAREER_AVG_PTS"]
+    recent_form = last["RECENT_FORM"]
+
+    # Historical avg vs next opponent across entire career
+    prior_vs_opp = full[full["OPP"] == next_opp]["PTS"]
+    vs_opp_avg = round(float(prior_vs_opp.mean()), 2) if not prior_vs_opp.empty else fallback
+
+    # Opponent defense this season
+    season_defense = data["league_defense_by_season"].get(current_season, {})
+    pts_allowed = season_defense.get(next_opp, LEAGUE_AVG_PTS_ALLOWED)
+    opp_adj = round(rolling_avg * (pts_allowed / LEAGUE_AVG_PTS_ALLOWED), 2)
+
+    return {
+        "ROLLING_AVG_PTS": rolling_avg,
+        "CAREER_AVG_PTS":  career_avg,
+        "RECENT_FORM":     recent_form,
+        "VS_OPP_AVG":      vs_opp_avg,
+        "OPP_ADJ":         opp_adj,
     }
 
 

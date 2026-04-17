@@ -176,6 +176,10 @@ class MonteCarloPredictor:
             "train_mae": round(best_error, 3),
         }
 
+    def predict(self, next_game_features: dict, optimal_weights: list) -> float:
+        """Apply optimal weights to a single game's features and return predicted points."""
+        return _predict_single(optimal_weights, next_game_features)
+
     def evaluate_test(self, test: pd.DataFrame) -> dict:
         """
         Apply the optimal weights to the test set (last 20 games) and

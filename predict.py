@@ -9,7 +9,7 @@ Usage:
 
 import argparse
 import sys
-from get_stats import build_career_dataset
+from get_stats import build_career_dataset, get_next_game_features
 from monte_carlo import MonteCarloPredictor, FEATURES
 
 
@@ -20,6 +20,8 @@ def main():
     parser.add_argument("--player", required=True, help='Full name, e.g. "Jayson Tatum"')
     parser.add_argument("--simulations", type=int, default=500,
                         help="MCST iterations for weight search (default: 500)")
+    parser.add_argument("--next-opponent", default=None,
+                        help="Opponent abbreviation for next game prediction, e.g. MIA")
     args = parser.parse_args()
 
     name_parts = args.player.strip().split()
@@ -55,6 +57,16 @@ def main():
     print(f"  RMSE:         {test_results['test_rmse']} pts")
     print(f"  Within 5 pts: {test_results['within_5']}%")
     print(f"  Within 10 pts:{test_results['within_10']}%")
+
+    # ── 4. Next game prediction (optional) ────────────────────────────────────
+    if args.next_opponent:
+        next_opp = args.next_opponent.upper()
+        print(f"\n--- Next game prediction: {first} {last} vs {next_opp} ---")
+        next_features = get_next_game_features(data, next_opp)
+        for feat, val in next_features.items():
+            print(f"  {feat}: {val}")
+        prediction = predictor.predict(next_features, train_results["optimal_weights"])
+        print(f"\n  Predicted points: {prediction}")
 
 
 if __name__ == "__main__":
